@@ -56,6 +56,11 @@ const withTracerDisabled = Effect.withTracerEnabled(false)
  * The optional `prefix` controls the table names for messages, replies, and
  * migrations; when omitted, `cluster` is used.
  *
+ * Set `migrate: false` when the tables are migrated ahead of time by
+ * {@link migrate}, run with a role that owns them. The storage then issues no
+ * DDL, so the runtime role needs only `SELECT`, `INSERT`, `UPDATE` and
+ * `DELETE`; it dies if a migration it depends on has not been applied.
+ *
  * **Gotchas**
  *
  * Changing `prefix` after deployment points the runtime at a different set of
@@ -69,6 +74,7 @@ const withTracerDisabled = Effect.withTracerEnabled(false)
  */
 export const makeEncoded: (options?: {
   readonly prefix?: string | undefined
+  readonly migrate?: boolean | undefined
 }) => Effect.Effect<
   MessageStorage.Encoded,
   never,
@@ -79,12 +85,7 @@ export const makeEncoded: (options?: {
   const prefix = options?.prefix ?? "cluster"
   const table = (name: string) => `${prefix}_${name}`
 
-  yield* Effect.orDie(
-    Migrator.make({})({
-      loader: migrations(options),
-      table: table("migrations")
-    })
-  )
+  yield* Effect.orDie(options?.migrate === false ? verifyMigrated(options) : migrate(options))
 
   const messageKindAckChunk = sql.literal(String(messageKind.AckChunk))
   const messageKindInterrupt = sql.literal(String(messageKind.Interrupt))
@@ -803,6 +804,7 @@ export const makeEncoded: (options?: {
  */
 export const make: (options?: {
   readonly prefix?: string | undefined
+  readonly migrate?: boolean | undefined
 }) => Effect.Effect<
   MessageStorage.MessageStorage["Service"],
   never,
@@ -849,6 +851,7 @@ export const layer: Layer.Layer<
 
 /**
  * Layer that provides SQL-backed `MessageStorage` using a custom table prefix.
+ * Pass `migrate: false` when the tables are managed with {@link migrate}.
  *
  * @stability unstable
  * @category layers
@@ -856,14 +859,65 @@ export const layer: Layer.Layer<
  */
 export const layerWith = (options: {
   readonly prefix?: string | undefined
+  readonly migrate?: boolean | undefined
 }): Layer.Layer<MessageStorage.MessageStorage, never, SqlClient.SqlClient | ShardingConfig | Crypto.Crypto> =>
   Layer.effect(MessageStorage.MessageStorage, make(options)).pipe(
     Layer.provide(Snowflake.layerGenerator)
   )
 
+/**
+ * Applies the message storage migrations for `prefix` and records them in
+ * the `<prefix>_migrations` table.
+ *
+ * **When to use**
+ *
+ * Use when a deploy or migration step, connected as the role that owns the
+ * cluster tables, applies them. Build the runtime storage with
+ * `migrate: false` so the runtime role needs no DDL privileges. Run it before
+ * deploying a version of `effect` that adds a migration.
+ *
+ * @stability unstable
+ * @category migrations
+ * @since 4.0.3
+ */
+export const migrate = (options?: {
+  readonly prefix?: string | undefined
+}): Effect.Effect<
+  ReadonlyArray<readonly [id: number, name: string]>,
+  Migrator.MigrationError | SqlError,
+  SqlClient.SqlClient
+> =>
+  Migrator.make({})({
+    loader: migrations(options),
+    table: `${options?.prefix ?? "cluster"}_migrations`
+  })
+
 // -------------------------------------------------------------------------------------------------
 // internal
 // -------------------------------------------------------------------------------------------------
+
+/** Fails unless every migration this version depends on is recorded as applied. */
+const verifyMigrated = Effect.fnUntraced(function*(options?: {
+  readonly prefix?: string | undefined
+}) {
+  const sql = (yield* SqlClient.SqlClient).withoutTransforms()
+  const table = `${options?.prefix ?? "cluster"}_migrations`
+  const required = yield* migrations(options)
+  const applied = new Set(
+    (yield* sql<{ readonly migration_id: number }>`SELECT migration_id FROM ${sql(table)}`).map((row) =>
+      Number(row.migration_id)
+    )
+  )
+  const missing = required.filter(([id]) => !applied.has(id))
+  if (missing.length > 0) {
+    return yield* new Migrator.MigrationError({
+      kind: "BadState",
+      message: `Cluster message storage migrations not applied to ${table}: ${
+        missing.map(([id, name]) => `${id}_${name}`).join(", ")
+      }. Run SqlMessageStorage.migrate with a role that owns the cluster tables.`
+    })
+  }
+})
 
 const migrations = (options?: {
   readonly prefix?: string | undefined

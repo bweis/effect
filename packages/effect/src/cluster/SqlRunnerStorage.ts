@@ -58,6 +58,11 @@ const postgresLockNamespace = (prefix: string): number => {
  * locks unless `ShardingConfig.shardLockDisableAdvisory` is enabled; other
  * dialects use rows in the locks table.
  *
+ * Set `migrate: false` when the tables are created ahead of time by
+ * {@link migrate}, run with a role that owns them. `make` then issues no DDL,
+ * so the runtime role needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE`;
+ * it fails if a table it needs is missing.
+ *
  * **Gotchas**
  *
  * Changing `prefix` changes both generated table names, so runners using
@@ -72,6 +77,7 @@ const postgresLockNamespace = (prefix: string): number => {
  */
 export const make = Effect.fnUntraced(function*(options: {
   readonly prefix?: string | undefined
+  readonly migrate?: boolean | undefined
 }) {
   const config = yield* ShardingConfig.ShardingConfig
   const shardGroups = ShardingConfig.shardGroupConfig(config)
@@ -182,99 +188,17 @@ export const make = Effect.fnUntraced(function*(options: {
 
   const runnersTable = table("runners")
   const runnersTableSql = sql(runnersTable)
-
-  yield* sql.onDialectOrElse({
-    mssql: () =>
-      sql`
-        IF OBJECT_ID(N'${runnersTableSql}', N'U') IS NULL
-        CREATE TABLE ${runnersTableSql} (
-          machine_id INT IDENTITY PRIMARY KEY,
-          address VARCHAR(255) NOT NULL,
-          runner TEXT NOT NULL,
-          healthy BIT NOT NULL DEFAULT 1,
-          last_heartbeat DATETIME NOT NULL DEFAULT GETDATE(),
-          UNIQUE(address)
-        )
-      `,
-    mysql: () =>
-      sql`
-        CREATE TABLE IF NOT EXISTS ${runnersTableSql} (
-          machine_id INT AUTO_INCREMENT PRIMARY KEY,
-          address VARCHAR(255) NOT NULL,
-          runner TEXT NOT NULL,
-          healthy BOOLEAN NOT NULL DEFAULT TRUE,
-          last_heartbeat DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE(address)
-        )
-      `,
-    pg: () =>
-      sql`
-        CREATE TABLE IF NOT EXISTS ${runnersTableSql} (
-          machine_id SERIAL PRIMARY KEY,
-          address VARCHAR(255) NOT NULL,
-          runner TEXT NOT NULL,
-          healthy BOOLEAN NOT NULL DEFAULT TRUE,
-          last_heartbeat TIMESTAMP NOT NULL DEFAULT NOW(),
-          UNIQUE(address)
-        )
-      `,
-    orElse: () =>
-      // sqlite
-      sql`
-        CREATE TABLE IF NOT EXISTS ${runnersTableSql} (
-          machine_id INTEGER PRIMARY KEY AUTOINCREMENT,
-          address TEXT NOT NULL,
-          runner TEXT NOT NULL,
-          healthy INTEGER NOT NULL DEFAULT 1,
-          last_heartbeat DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-          UNIQUE(address)
-        )
-      `
-  })
-
   const locksTable = table("locks")
   const locksTableSql = sql(locksTable)
 
-  yield* sql.onDialectOrElse({
-    mssql: () =>
-      sql`
-        IF OBJECT_ID(N'${locksTableSql}', N'U') IS NULL
-        CREATE TABLE ${locksTableSql} (
-          shard_id VARCHAR(50) PRIMARY KEY,
-          address VARCHAR(255) NOT NULL,
-          acquired_at DATETIME NOT NULL
-        )
-      `,
-    mysql: () =>
-      disableAdvisoryLocks ?
-        sql`
-          CREATE TABLE IF NOT EXISTS ${locksTableSql} (
-            shard_id VARCHAR(50) PRIMARY KEY,
-            address VARCHAR(255) NOT NULL,
-            acquired_at DATETIME NOT NULL
-          )
-        ` :
-        Effect.void,
-    pg: () =>
-      disableAdvisoryLocks ?
-        sql`
-          CREATE TABLE IF NOT EXISTS ${locksTableSql} (
-            shard_id VARCHAR(50) PRIMARY KEY,
-            address VARCHAR(255) NOT NULL,
-            acquired_at TIMESTAMP NOT NULL
-          )
-        ` :
-        Effect.void,
-    orElse: () =>
-      // sqlite
-      sql`
-        CREATE TABLE IF NOT EXISTS ${locksTableSql} (
-          shard_id TEXT PRIMARY KEY,
-          address TEXT NOT NULL,
-          acquired_at DATETIME NOT NULL
-        )
-      `
-  })
+  if (options?.migrate === false) {
+    yield* sql`SELECT 1 FROM ${runnersTableSql} WHERE 1 = 0`
+    if (usesLocksTable(sql, disableAdvisoryLocks)) {
+      yield* sql`SELECT 1 FROM ${locksTableSql} WHERE 1 = 0`
+    }
+  } else {
+    yield* createTables(sql, prefix, usesLocksTable(sql, disableAdvisoryLocks))
+  }
 
   const sqlNowString = sql.onDialectOrElse({
     pg: () => "NOW()",
@@ -779,6 +703,7 @@ export const layer: Layer.Layer<
 
 /**
  * Layer that provides SQL-backed `RunnerStorage` using a custom table prefix.
+ * Pass `migrate: false` when the tables are managed with {@link migrate}.
  *
  * @stability unstable
  * @category layers
@@ -786,5 +711,144 @@ export const layer: Layer.Layer<
  */
 export const layerWith = (options: {
   readonly prefix?: string | undefined
+  readonly migrate?: boolean | undefined
 }): Layer.Layer<RunnerStorage.RunnerStorage, SqlError, SqlClient.SqlClient | ShardingConfig.ShardingConfig> =>
   Layer.effect(RunnerStorage.RunnerStorage)(make(options))
+
+/**
+ * Creates the runner storage tables for `prefix`, if they do not exist.
+ *
+ * **When to use**
+ *
+ * Use when a deploy or migration step, connected as the role that owns the
+ * cluster tables, applies them. Build the runtime storage with
+ * `migrate: false` so the runtime role needs no DDL privileges.
+ *
+ * **Details**
+ *
+ * Always creates the locks table, which is only used where advisory locks
+ * are unavailable or `ShardingConfig.shardLockDisableAdvisory` is set, so one
+ * migration step serves either setting.
+ *
+ * @stability unstable
+ * @category migrations
+ * @since 4.0.3
+ */
+export const migrate = (options?: {
+  readonly prefix?: string | undefined
+}): Effect.Effect<void, SqlError, SqlClient.SqlClient> =>
+  Effect.gen(function*() {
+    const sql = (yield* SqlClient.SqlClient).withoutTransforms()
+    yield* createTables(sql, options?.prefix ?? "cluster", true)
+  })
+
+// -------------------------------------------------------------------------------------------------
+// internal
+// -------------------------------------------------------------------------------------------------
+
+/** PostgreSQL and MySQL hold shard locks as advisory locks unless they are disabled. */
+const usesLocksTable = (sql: SqlClient.SqlClient, disableAdvisoryLocks: boolean): boolean =>
+  sql.onDialectOrElse({
+    pg: () => disableAdvisoryLocks,
+    mysql: () => disableAdvisoryLocks,
+    orElse: () => true
+  })
+
+const createTables = Effect.fnUntraced(function*(
+  sql: SqlClient.SqlClient,
+  prefix: string,
+  withLocksTable: boolean
+) {
+  const runnersTableSql = sql(`${prefix}_runners`)
+  const locksTableSql = sql(`${prefix}_locks`)
+
+  yield* sql.onDialectOrElse({
+    mssql: () =>
+      sql`
+        IF OBJECT_ID(N'${runnersTableSql}', N'U') IS NULL
+        CREATE TABLE ${runnersTableSql} (
+          machine_id INT IDENTITY PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          runner TEXT NOT NULL,
+          healthy BIT NOT NULL DEFAULT 1,
+          last_heartbeat DATETIME NOT NULL DEFAULT GETDATE(),
+          UNIQUE(address)
+        )
+      `,
+    mysql: () =>
+      sql`
+        CREATE TABLE IF NOT EXISTS ${runnersTableSql} (
+          machine_id INT AUTO_INCREMENT PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          runner TEXT NOT NULL,
+          healthy BOOLEAN NOT NULL DEFAULT TRUE,
+          last_heartbeat DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(address)
+        )
+      `,
+    pg: () =>
+      sql`
+        CREATE TABLE IF NOT EXISTS ${runnersTableSql} (
+          machine_id SERIAL PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          runner TEXT NOT NULL,
+          healthy BOOLEAN NOT NULL DEFAULT TRUE,
+          last_heartbeat TIMESTAMP NOT NULL DEFAULT NOW(),
+          UNIQUE(address)
+        )
+      `,
+    orElse: () =>
+      // sqlite
+      sql`
+        CREATE TABLE IF NOT EXISTS ${runnersTableSql} (
+          machine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          address TEXT NOT NULL,
+          runner TEXT NOT NULL,
+          healthy INTEGER NOT NULL DEFAULT 1,
+          last_heartbeat DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+          UNIQUE(address)
+        )
+      `
+  })
+
+  yield* sql.onDialectOrElse({
+    mssql: () =>
+      sql`
+        IF OBJECT_ID(N'${locksTableSql}', N'U') IS NULL
+        CREATE TABLE ${locksTableSql} (
+          shard_id VARCHAR(50) PRIMARY KEY,
+          address VARCHAR(255) NOT NULL,
+          acquired_at DATETIME NOT NULL
+        )
+      `,
+    mysql: () =>
+      withLocksTable ?
+        sql`
+          CREATE TABLE IF NOT EXISTS ${locksTableSql} (
+            shard_id VARCHAR(50) PRIMARY KEY,
+            address VARCHAR(255) NOT NULL,
+            acquired_at DATETIME NOT NULL
+          )
+        ` :
+        Effect.void,
+    pg: () =>
+      withLocksTable ?
+        sql`
+          CREATE TABLE IF NOT EXISTS ${locksTableSql} (
+            shard_id VARCHAR(50) PRIMARY KEY,
+            address VARCHAR(255) NOT NULL,
+            acquired_at TIMESTAMP NOT NULL
+          )
+        ` :
+        Effect.void,
+    orElse: () =>
+      // sqlite
+      sql`
+        CREATE TABLE IF NOT EXISTS ${locksTableSql} (
+          shard_id TEXT PRIMARY KEY,
+          address TEXT NOT NULL,
+          acquired_at DATETIME NOT NULL
+        )
+      `
+  })
+})
